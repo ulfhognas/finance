@@ -1,0 +1,335 @@
+---
+title: "Some Scripts"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: fill
+    storyboard: true
+---
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(dygraphs)
+library(Quandl)
+library(forecast)
+library(rugarch)
+library(tseries)
+library(ffp)
+```
+
+### Volatility, Four Models
+
+```{r}
+vol.function <- function(stock = "AMD", start.date = "2009-12-31"){
+  AMD <- Quandl(paste0("WIKI/",stock), start_date = start.date)
+  
+  #name rows after column date for easier xts implementation
+  #remove date column
+  rownames(AMD)<-AMD$Date
+  AMD<-AMD[,-1]
+  AMD <- as.xts(AMD)
+  
+  #create time series plot of price
+  dygraph(AMD$Close, 
+          main = paste(stock,"Closing Price"),
+          ylab = "Price ($)")
+  #create log returns
+  AMD$logclose <- log(AMD$`Adj. Close`)
+  AMD$logreturn <- diff(AMD$logclose)
+  AMD$logreturn.sq <- (AMD$logreturn)^2
+  #remove first observation since returns are missing
+  #save number of rows as n
+  AMD<-AMD[-1,]
+  n <- nrow(AMD)
+  
+  #estimate variance with exp smoothing 
+  #first aplha chosen with maximum likelihood 
+  #then lamda 0.94 i.e. alpha 0.06, following RiskMetrics
+  exp.smo <- ses(AMD$logreturn.sq, h = 5)
+  exp.smo.l094 <- ses(AMD$logreturn.sq, h = 5, alpha = 0.06)
+  
+  
+  AMD <- merge(AMD, exp.smo$fitted)
+  AMD <- merge(AMD, exp.smo.l094$fitted)
+  colnames(AMD)[colnames(AMD)=="exp.smo.fitted.1"]<-"exp.smo.fitted"
+  
+  #square root of the estimated variances gives us
+  #daily volatility (non-annualized)
+  AMD$exp.smo.vol <- sqrt(AMD$exp.smo.fitted)
+  AMD$exp.smo.vol094 <- sqrt(AMD$exp.smo.l094.fitted)
+  
+  #GARCH(1,1) normally distributed errors assumption
+  #rugarch package
+  spec <- ugarchspec(
+    variance.model = list(
+      model = "sGARCH",
+      garchOrder = c(1, 1),
+      submodel = NULL,
+      external.regressors = NULL,
+      variance.targeting = FALSE),
+    distribution.model = "norm",
+    mean.model = list(
+      armaOrder = c(0, 0),
+      external.regressors = NULL))
+  
+  garch <- ugarchfit(
+    spec = spec,
+    data = AMD$logreturn,
+    solver.control = list(trace=0))
+  
+  AMD$garch11normal <- garch@fit$sigma
+  
+  #GARCH(1,1) skewed student t-distributed errors assumption
+  #rugarch package
+  spec2 <- ugarchspec(
+    variance.model = list(
+      model = "sGARCH",
+      garchOrder = c(1, 1),
+      submodel = NULL,
+      external.regressors = NULL,
+      variance.targeting = FALSE),
+    distribution.model = "sstd",
+    mean.model = list(
+      armaOrder = c(0, 0),
+      external.regressors = NULL))
+  
+  garch2 <- ugarchfit(
+    spec = spec2,
+    data = AMD$logreturn,
+    solver.control = list(trace=0))
+  
+  AMD$garch11sstd <- garch2@fit$sigma
+  
+  graph <- dygraph(
+    AMD[,c("exp.smo.vol","exp.smo.vol094","garch11normal","garch11sstd")],
+    main = "Volatility Estimates")
+  newList <- list("graph" = graph,
+                  "garch11sstd" = garch2,
+                  "logreturns" = AMD$logreturn)
+  return(newList)
+}
+
+vol.list <- vol.function("KO")
+vol.list$graph
+#length(which(2*sigma(vol.list$garch11sstd)<abs(vol.list$logreturns)))/length(vol.list$logreturns)
+#(1-pskt(2, df = 2071, gamma = as.vector(coef(vol.list$garch11sstd)["skew"])))*2
+```
+
+### Fit, Skewed Student's t-distribution Errors
+
+```{r}
+plot(vol.list$garch11sstd, which=8)
+```
+
+### Fit, Skewed Student's t-distribution, two SD superimposed
+
+```{r}
+plot(vol.list$garch11sstd, which = 1)
+```
+
+### Value-at-Risk, Montecarlo and Historical Simulations
+
+```{r}
+#6 stocks from dukascopy
+
+ATT <- read.csv("T.USUSD_Candlestick_1_D_BID_02.11.2017-18.09.2021.csv")
+NKE <- read.csv("NKE.USUSD_Candlestick_1_D_BID_02.11.2017-18.09.2021.csv")
+MSFT <- read.csv("MSFT.USUSD_Candlestick_1_D_BID_11.05.2017-18.09.2021.csv")
+KO <- read.csv("KO.USUSD_Candlestick_1_D_BID_11.05.2017-18.09.2021.csv")
+DG <- read.csv("DG.USUSD_Candlestick_1_D_BID_11.05.2017-18.09.2021.csv")
+CI <- read.csv("CI.USUSD_Candlestick_1_D_BID_11.05.2017-18.09.2021.csv")
+
+return.fun <- function(security, days = 900){
+  m <- nrow(security)
+  security$logreturn <- c(NA, diff(log(security$Close)))
+  security[(m-(days-1)):m,]
+}
+ATT <- return.fun(ATT)
+NKE <- return.fun(NKE)
+MSFT <- return.fun(MSFT)
+KO <- return.fun(KO)
+DG <- return.fun(DG)
+CI <- return.fun(CI)
+
+close <- cbind(
+  ATT$Close,
+  NKE$Close,
+  MSFT$Close,
+  KO$Close,
+  DG$Close,
+  CI$Close)
+
+logreturn <- cbind(
+  ATT$logreturn,
+  NKE$logreturn,
+  MSFT$logreturn,
+  KO$logreturn,
+  DG$logreturn,
+  CI$logreturn)
+
+first10 <- function(x){
+  substr(x, 1, 10)
+}
+
+logreturn.df <- data.frame(logreturn,
+                           row.names = first10(ATT$Local.time))
+names(logreturn.df) <-  c("ATT", "NKE", "MSFT", "KO", "DG", "CI")
+
+#print("Recent log returns:")
+#tail(logreturn.df)
+m<-nrow(logreturn.df)
+n<-ncol(logreturn.df)
+
+#define weights
+w <- rep(1, n)/n
+
+
+#check if positive definite
+#A real symmetric n x n matrix is positive definite
+#if and only if all its eigenvalues are strictly positive real numbers.
+#
+#if this is sample data with no missing data, it will be pos. def.
+positive.eigen <- function(A){
+  sum(eigen(A)$values<=0)==0
+}
+
+weighted.sigma.fun<-function(returns, lamda = 0.94){
+  m <- nrow(returns)
+  n <- ncol(returns)
+  
+  lamda.fun <- function(m, lamda = 0.94){
+    lamda.weights <- rep(0, m)
+    for (i in 1:m){
+      lamda.weights[i] <- sqrt(lamda^(i-1))
+    }
+    lamda.weights
+  }
+  
+  lamda.weights <- lamda.fun(m, lamda = 0.94)
+  #length(lamda.weights)==n
+  W <- matrix(rep(NA,m*n),ncol=n)
+  for (i in 1:n){
+    W[,i]<-returns[,i]*lamda.weights
+  }
+  R <- sqrt((1-lamda)/(1-lamda^(m)))*W
+  Sigma1 <- t(R)%*%R
+  newList <- list("Sigma1" = Sigma1,
+                  "weighted.returns" = W)
+  return(newList)
+}
+
+Sigma1 <- weighted.sigma.fun(logreturn.df)$Sigma1
+weighted.returns <- weighted.sigma.fun(logreturn.df)$weighted.returns
+pos.def <- positive.eigen(Sigma1)
+print(paste(
+  "The covariance matrix of weighted returns is positive definite: ",
+  pos.def))
+C <- chol(Sigma1)
+#verify that t(C)%*%C == Sigma1
+#...to the 15th decimal place
+approximation <- sum(round(t(C)%*%C-Sigma1, 15))==0
+print(paste(
+  "The Cholesky decomposition is accurate to 15 decimal places: ", 
+  approximation))
+
+
+print("Unweighted correlation of returns:")
+cor(logreturn.df)
+print("Weigted correlation of returns, lamda = 0.94:")
+D.star <- diag(Sigma1)^(-0.5)
+diag(D.star)%*%Sigma1%*%diag(D.star)
+```
+
+### Montecarlo and Historical Bootstrap, 100,000 Simulations Each
+
+```{r}
+#k simulations 10 days out
+k <- 1e5
+n <- ncol(logreturn.df)
+z <- matrix(rnorm(n*k), ncol = k)
+
+#efficient frontier weights, mean preserving, no shorts
+w2<-portfolio.optim(weighted.returns)$pw
+#100,000 simulations at 10 days
+mc.results <- rep(NA, k)
+mc.results.optim <- rep(NA, k)
+for (i in 1:k){
+  mc.results[i] <- sum(t(C)%*%z[,i]*sqrt(10)*w)
+  mc.results.optim[i] <- sum(t(C)%*%z[,i]*sqrt(10)*w2)
+}
+
+print("Montecarlo Simulations")
+percentile1 <- quantile(mc.results, 1-0.95)
+percentile1.optim <- quantile(mc.results.optim, 1-0.95)
+print(paste("The 95% VaR is: ", round(percentile1, 4)))
+print(paste0("Assuming $1M and 2% risk-free return, this is $", round(abs(1e6*exp(0.02*10/360)-1e6*(1+percentile1)))))
+print(paste("With efficient frontier weights: ", round(percentile1.optim, 4)))
+print(paste0("Assuming $1M and 2% risk-free return, this is $", round(abs(1e6*exp(0.02*10/360)-1e6*(1+percentile1.optim)))))
+
+n1 <- 10
+
+historical.sim.results <- rep(NA, k)
+historical.sim.results.optim <- rep(NA, k)
+for (i in 1:k){
+  r0ws <- sample(1:m, n1, replace = TRUE)
+  choice <- logreturn.df[r0ws,]
+  change <- apply(choice+1, prod, MARGIN = 2)-1
+  historical.sim.results[i] <- sum(change*w)
+  historical.sim.results.optim[i] <- sum(change*w2)
+}
+print("################################")
+print("Historical Bootstrap Simulations")
+percentile2 <- quantile(historical.sim.results, 1-0.95)
+percentile2.optim <- quantile(historical.sim.results.optim, 1-0.95)
+print(paste("The 95% VaR is: ", round(percentile2, 4)))
+print(paste0("Assuming $1M and 2% risk-free return, this is $", round(abs(1e6*exp(0.02*10/360)-1e6*(1+percentile2)))))
+print(paste("With efficient frontier weights: ", round(percentile2.optim, 4)))
+print(paste0("Assuming $1M and 2% risk-free return, this is $", round(abs(1e6*exp(0.02*10/360)-1e6*(1+percentile2.optim)))))
+```
+
+### Histogram of Simulated Returns
+
+```{r, include=FALSE}
+p2 <- hist(historical.sim.results, 
+           breaks = 100,
+           main = "Histogram of Historical Bootstrap Simulations",
+           xlab = "Simulated Portfolio Returns")
+
+p1 <- hist(mc.results, 
+           breaks = p2$breaks,
+           main = "Histogram of MC Simulations",
+           xlab = "Simulated Portfolio Returns")
+
+```
+
+```{r}
+plot( p1,
+      col = rgb(0,0,1,1/4),
+      xlim = c(-.18,.18),
+      ylim = c(0, 6200),
+      xlab = "return",
+      main = "MC and Historical BS, 100k Simulations")  # first histogram
+plot( p2, col=rgb(1,0,0,1/4),
+      xlim=c(-.18,.18),
+      ylim = c(0, 6200),
+      add=T)  # second
+abline(v=percentile1, col=rgb(0.1,0.1,0.6,3/4), lty = 2)
+abline(v=percentile2, col=rgb(0.6,0.1,0.1,3/4), lty = 2)
+
+legend("topright",
+       legend = c("Montecarlo", "Historical BS"),
+       col = c(rgb(0,0,1,1/4), rgb(1,0,0,1/4)),
+       pch = 15)
+```
+
+### Q-Q Plots
+
+```{r}
+par(mfrow = c(1,2))
+qqnorm(mc.results, main = "Montecarlo")
+qqline(mc.results, col = "red")
+qqnorm(historical.sim.results, main = "Historical BS")
+qqline(historical.sim.results, col="red")
+```
+
+
