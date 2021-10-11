@@ -19,6 +19,8 @@ library(ffp)
 
 ### Volatility, Four Models
 
+Coca-Cola Co. Click and drag on the graph to zoom.
+
 ```{r}
 vol.function <- function(stock = "AMD", start.date = "2009-12-31"){
   AMD <- Quandl(paste0("WIKI/",stock), start_date = start.date)
